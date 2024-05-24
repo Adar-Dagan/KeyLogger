@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Local;
 use daemonize::Daemonize;
 use evdev::{Device, InputEvent, InputEventKind, Key, LedType};
+use log::{debug, error, info, trace};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::AsyncWriteExt,
@@ -69,8 +70,25 @@ impl State {
 ///
 /// Panics if .
 pub fn run() -> ! {
-    let stdout = std::fs::File::create("./tmpout").unwrap();
-    let stderr = std::fs::File::create("./tmperr").unwrap();
+    trace!("Creating stdio files for daemon loging");
+    let stdout = match std::fs::File::create("./tmpout")
+        .with_context(|| "Failed to create and open stdio file for daemon")
+    {
+        Ok(f) => f,
+        Err(err) => {
+            error!("{err:?}");
+            exit(1);
+        }
+    };
+    let stderr = match std::fs::File::create("./tmperr")
+        .with_context(|| "Failed to create and open stdio file for daemon")
+    {
+        Ok(f) => f,
+        Err(err) => {
+            error!("{err:?}");
+            exit(1);
+        }
+    };
 
     let daemonizer = Daemonize::new()
         .pid_file("./tmp.pid")
@@ -78,27 +96,24 @@ pub fn run() -> ! {
         .stderr(stderr)
         .privileged_action(|| "Executed before drop privileges");
 
-    match daemonizer.start() {
-        Err(_) => {
-            println!("Fail to create daemon. Missing sudo?");
+    match daemonizer.start().with_context(|| "Failed to start daemon") {
+        Err(err) => {
+            error!("{err:?}");
         }
         Ok(_) => {
             if let Err(err) = main() {
-                println!("{err}");
+                error!("{err:?}");
             }
         }
     }
 
-    println!("exiting");
-
+    info!("Closing");
     exit(1)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("here");
     let devices: Vec<Device> = evdev::enumerate().map(|t| t.1).collect();
-    println!("here");
 
     if devices.is_empty() {
         bail!("Coundn't find any device. Sudo Please");

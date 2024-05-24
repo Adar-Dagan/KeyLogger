@@ -18,3 +18,5 @@ chrono = "0.4"
 evdev = { version = "0.12.2", features = ["tokio"]}
 anyhow = "1.0.86"
 daemonize = "0.5.0"
+simplelog = "0.12.2"
+log = "0.4.21"
