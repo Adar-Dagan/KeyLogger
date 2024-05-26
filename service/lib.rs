@@ -1,22 +1,19 @@
-use std::{
-    env,
-    path::{Path, PathBuf},
-    process::exit,
-    time::UNIX_EPOCH,
-};
+use std::{env, io::Read, path::PathBuf, process::exit, time::UNIX_EPOCH};
 
 use anyhow::{bail, Context, Error, Result};
 use chrono::Local;
-use daemonize::{Daemonize, Outcome, Stdio};
+use daemonize::{Daemonize, Outcome};
 use evdev::{Device, InputEvent, InputEventKind, Key, LedType};
-use log::{debug, error, trace, LevelFilter};
-use simplelog::{Config, SimpleLogger};
+use log::{debug, error, info, trace};
+use rustix::process::{kill_process, Pid, RawPid, Signal};
 use tokio::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::AsyncWriteExt,
     sync::mpsc::{self, Receiver},
     task::JoinSet,
 };
+
+const PID_FILE_PATH: &str = "/run/keylogger.pid";
 
 #[derive(Debug)]
 struct State {
@@ -70,34 +67,25 @@ impl State {
     }
 }
 
-/// Creates keylogger daemon service. Will fork off a process and calls [run()]
+/// Creates keylogger daemon service. Will fork off a process and calls [`start()`]
 ///
 /// # Errors
 ///
 /// This function will return an error if daemon creation failed.
 pub fn create() -> Result<()> {
-    let daemonizer = Daemonize::new()
-        .pid_file("/run/keylogger.pid")
-        .privileged_action(|| "Executed before drop privileges");
+    let daemonizer = Daemonize::new().pid_file(PID_FILE_PATH);
 
     match daemonizer.execute() {
         Outcome::Parent(res) => {
             res.with_context(|| "Failed to start daemon")?;
         }
         Outcome::Child(res) => {
-            error!(
-                "{:?}",
-                if let Err(err) = res.with_context(|| "Daemon failed to start") {
-                    err
-                } else {
-                    debug!("Daemon started succesfully");
-                    if let Err(err) = run().with_context(|| "Fatal error") {
-                        err
-                    } else {
-                        Error::msg("Unknown error occured")
-                    }
-                }
-            );
+            if let Err(err) = res.with_context(|| "Daemon failed to start") {
+                error!("{:?}", err);
+            } else {
+                debug!("Daemon started succesfully");
+                start();
+            }
             exit(1);
         }
     }
@@ -105,20 +93,28 @@ pub fn create() -> Result<()> {
     Ok(())
 }
 
-/// Runs the keylogger in the current process
-///
-/// # Errors
-///
-/// This function will return an error if a fatal error occurred, mean the keylogger could not
-/// recover from the error.
-#[tokio::main]
-pub async fn run() -> Result<()> {
+/// Starts keylogger in current process, returns only if there was a fatal error.
+pub fn start() {
+    if let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        runtime.block_on(async {
+            if let Err(err) = start_logger().await {
+                error!("{err:?}");
+            }
+        });
+    }
+}
+
+async fn start_logger() -> Result<()> {
     trace!("keylogger starting");
     let devices: Vec<Device> = evdev::enumerate().map(|t| t.1).collect();
 
     if devices.is_empty() {
-        bail!("Coundn't find any device.");
+        bail!("Coundn't find any device. Missing sudo?");
     }
+    trace!("Found {} devices", devices.len());
 
     let initial_state: State =
         get_keyboard_state(&devices).with_context(|| "Failed to initialize keyboard state")?;
@@ -138,7 +134,6 @@ pub async fn run() -> Result<()> {
 }
 
 fn get_keyboard_state(devices: &[Device]) -> Result<State> {
-    // let led_state: evdev::AttributeSet<LedType> = devices
     let led_device = devices
         .iter()
         .find(|device| {
@@ -183,7 +178,7 @@ fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSe
     (rx, join_set)
 }
 
-async fn open_log_file() -> Result<File> {
+async fn open_log_file() -> Result<tokio::fs::File> {
     let user = env::var_os("SUDO_USER").with_context(|| "SUDO_USER not defined")?;
     let user = user.to_str().with_context(|| "Invalid user name")?;
 
@@ -227,4 +222,33 @@ async fn spawn_event_reader(mut rx: Receiver<InputEvent>, initial_state: State) 
         trace!("{eventr:?}");
     }
     bail!("Event receiver was closed")
+}
+
+const fn invalid_content() -> &'static str {
+    "Failed to parse pid from file"
+}
+
+/// Sends the daemon SIGINT to kill it.
+/// # Errors
+///
+/// This function will return an error if any part of the process doesn't succeed
+pub fn stop() -> Result<()> {
+    let mut file = std::fs::File::open(PID_FILE_PATH)?;
+
+    if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
+        bail!("Daemon is not running");
+    }
+
+    let mut file_string = String::new();
+    file.read_to_string(&mut file_string)
+        .with_context(invalid_content)?;
+    let file_string = file_string.trim();
+    info!("Read file content: {file_string}");
+    let raw_pid = RawPid::from_str_radix(file_string, 10).with_context(invalid_content)?;
+    let pid = Pid::from_raw(raw_pid).with_context(invalid_content)?;
+    debug!("Read pid from file: {pid:?}");
+
+    kill_process(pid, Signal::Int).with_context(|| "Failed to kill process")?;
+
+    Ok(())
 }

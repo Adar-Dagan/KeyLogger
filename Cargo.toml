@@ -20,3 +20,14 @@ anyhow = "1.0.86"
 daemonize = "0.5.0"
 simplelog = "0.12.2"
 log = "0.4.21"
+clap = { version = "4.5.4", features = ["derive"] }
+rustix = { version = "0.38.34", features = ["fs", "process"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "deny"
+unwrap_used = "deny"
