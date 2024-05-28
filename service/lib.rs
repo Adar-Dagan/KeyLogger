@@ -1,13 +1,11 @@
-use std::{env, io::Read, path::PathBuf, process::exit, time::UNIX_EPOCH};
+use std::{io::Read, process::exit, time::UNIX_EPOCH};
 
 use anyhow::{bail, Context, Error, Result};
-use chrono::Local;
 use daemonize::{Daemonize, Outcome};
 use evdev::{Device, InputEvent, InputEventKind, Key, LedType};
 use log::{debug, error, info, trace};
 use rustix::process::{kill_process, Pid, RawPid, Signal};
 use tokio::{
-    fs::{self, OpenOptions},
     io::AsyncWriteExt,
     sync::mpsc::{self, Receiver},
     task::JoinSet,
@@ -72,19 +70,21 @@ impl State {
 /// # Errors
 ///
 /// This function will return an error if daemon creation failed.
-pub fn create() -> Result<()> {
+pub fn create(log_file: std::fs::File) -> Result<()> {
     let daemonizer = Daemonize::new().pid_file(PID_FILE_PATH);
 
     match daemonizer.execute() {
         Outcome::Parent(res) => {
-            res.with_context(|| "Failed to start daemon")?;
+            res.context("Failed to start daemon")?;
         }
         Outcome::Child(res) => {
-            if let Err(err) = res.with_context(|| "Daemon failed to start") {
+            if let Err(err) = res.context("Daemon failed to start") {
                 error!("{:?}", err);
             } else {
                 debug!("Daemon started succesfully");
-                start();
+                if let Err(err) = start(log_file) {
+                    error!("{err:?}");
+                }
             }
             exit(1);
         }
@@ -93,21 +93,22 @@ pub fn create() -> Result<()> {
     Ok(())
 }
 
-/// Starts keylogger in current process, returns only if there was a fatal error.
-pub fn start() {
-    if let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+/// Starts keylogger in current process, does not return unless a fatal error occurred.
+///
+/// # Errors
+///
+/// Returns if any part of the keylogger encountered a fatal error.
+pub fn start(log_file: std::fs::File) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-    {
-        runtime.block_on(async {
-            if let Err(err) = start_logger().await {
-                error!("{err:?}");
-            }
-        });
-    }
+        .context("Failed to initiate tokio runtime")?
+        .block_on(async { start_logger(log_file).await })
 }
 
-async fn start_logger() -> Result<()> {
+async fn start_logger(log_file: std::fs::File) -> Result<()> {
+    let log_file = tokio::fs::File::from_std(log_file);
+
     trace!("keylogger starting");
     let devices: Vec<Device> = evdev::enumerate().map(|t| t.1).collect();
 
@@ -117,12 +118,12 @@ async fn start_logger() -> Result<()> {
     trace!("Found {} devices", devices.len());
 
     let initial_state: State =
-        get_keyboard_state(&devices).with_context(|| "Failed to initialize keyboard state")?;
+        get_keyboard_state(&devices).context("Failed to initialize keyboard state")?;
 
     let (rx, mut join_set) = spawn_device_listeners(devices);
 
     join_set.spawn(async move {
-        spawn_event_reader(rx, initial_state).await?;
+        spawn_event_reader(rx, initial_state, log_file).await?;
         Ok(())
     });
 
@@ -162,15 +163,10 @@ fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSe
         join_set.spawn(async move {
             let mut stream = device
                 .into_event_stream()
-                .with_context(|| "Failed to create device stream")?;
+                .context("Failed to create device stream")?;
             loop {
-                let event = stream
-                    .next_event()
-                    .await
-                    .with_context(|| "Failed to read event")?;
-                tx.send(event)
-                    .await
-                    .with_context(|| "Failed to send event")?;
+                let event = stream.next_event().await.context("Failed to read event")?;
+                tx.send(event).await.context("Failed to send event")?;
             }
         });
     }
@@ -178,55 +174,30 @@ fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSe
     (rx, join_set)
 }
 
-async fn open_log_file() -> Result<tokio::fs::File> {
-    let user = env::var_os("SUDO_USER").with_context(|| "SUDO_USER not defined")?;
-    let user = user.to_str().with_context(|| "Invalid user name")?;
-
-    let datetime = Local::now();
-    let date = datetime.format("%Y-%m-%d");
-
-    let path = PathBuf::from(format!("/home/{user}/.keylogger/{date}.log"));
-
-    fs::create_dir_all(
-        path.parent()
-            .with_context(|| "Something went wrong with path creation")?,
-    )
-    .await
-    .with_context(|| "Failed to create log directory")?;
-
-    Ok(OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
-        .await?)
-}
-
-async fn spawn_event_reader(mut rx: Receiver<InputEvent>, initial_state: State) -> Result<()> {
+async fn spawn_event_reader(
+    mut rx: Receiver<InputEvent>,
+    initial_state: State,
+    mut log_file: tokio::fs::File,
+) -> Result<()> {
     let mut state = initial_state;
-
-    let mut log_file = open_log_file()
-        .await
-        .with_context(|| "Failed to open log file")?;
 
     while let Some(eventr) = rx.recv().await {
         let time = eventr.timestamp();
         let t = time
             .duration_since(UNIX_EPOCH)
-            .with_context(|| "UNIX_EPOCHE is after the timestamp of the event???")?
+            .context("UNIX_EPOCHE is after the timestamp of the event???")?
             .as_nanos();
         log_file
             .write_all(format!("{t}\n").as_bytes())
             .await
-            .with_context(|| "Failed to write to log")?;
+            .context("Failed to write to log")?;
         state.update(eventr);
         trace!("{eventr:?}");
     }
     bail!("Event receiver was closed")
 }
 
-const fn invalid_content() -> &'static str {
-    "Failed to parse pid from file"
-}
+const INVALID_CONTENT: &str = "Failed to parse pid from file";
 
 /// Sends the daemon SIGINT to kill it.
 /// # Errors
@@ -241,14 +212,14 @@ pub fn stop() -> Result<()> {
 
     let mut file_string = String::new();
     file.read_to_string(&mut file_string)
-        .with_context(invalid_content)?;
+        .context(INVALID_CONTENT)?;
     let file_string = file_string.trim();
     info!("Read file content: {file_string}");
-    let raw_pid = RawPid::from_str_radix(file_string, 10).with_context(invalid_content)?;
-    let pid = Pid::from_raw(raw_pid).with_context(invalid_content)?;
+    let raw_pid = RawPid::from_str_radix(file_string, 10).context(INVALID_CONTENT)?;
+    let pid = Pid::from_raw(raw_pid).context(INVALID_CONTENT)?;
     debug!("Read pid from file: {pid:?}");
 
-    kill_process(pid, Signal::Int).with_context(|| "Failed to kill process")?;
+    kill_process(pid, Signal::Int).context("Failed to kill process")?;
 
     Ok(())
 }
